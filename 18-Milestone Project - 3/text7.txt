@@ -1,0 +1,211 @@
+"""Codebeamer client adapter.
+
+This module provides a defensive, minimal wrapper around ``calmpy`` that:
+    * Creates/owns a ``calmpy.Server`` instance.
+    * Fetches a Codebeamer item and extracts commonly used fields.
+    * Normalizes the "Test Steps" heterogeneous field (list-of-dicts or plain text)
+      into a stable text block consumable by the local parser.
+    * Coerces trivial placeholder values (``N/A``, ``-``, ``None``) to ``None``
+      for Pre-Action/Post-Action fields.
+
+It returns a :class:`cbapp.models.CBItem` to decouple GUI/engine code from the
+raw API surface of Codebeamer and ``calmpy``.
+"""
+from __future__ import annotations
+
+__all__ = ["CodebeamerClientProtocol", "CodebeamerClient"]
+
+import logging
+from collections.abc import Mapping
+from typing import Any, Optional, Protocol
+
+import calmpy  # type: ignore
+from .models import CBItem
+
+logger = logging.getLogger(__name__)
+
+
+class CodebeamerClientProtocol(Protocol):
+    """Structural interface for Codebeamer item retrieval.
+
+    Any object implementing ``get_item`` is a valid client and can be
+    injected wherever ``CodebeamerClient`` is currently used. This enables
+    unit testing without a live Codebeamer connection.
+    """
+
+    def get_item(self, item_id: int) -> CBItem:
+        """Fetch a Codebeamer item by its numeric ID.
+
+        Args:
+            item_id: Numeric Codebeamer item ID.
+
+        Returns:
+            Normalized ``CBItem`` container.
+        """
+        ...
+
+
+class CodebeamerClient:
+    """Thin wrapper around ``calmpy.Server`` and ``calmpy.Item``.
+
+    The client defends against field-name variants across trackers/templates and
+    produces a normalized :class:`CBItem`.
+
+    Notes:
+        * The "Test Steps" field in Codebeamer may be:
+          1) A list of dicts (``{"Action": "...", "Expected Result": "..."}``)
+          2) A raw (possibly HTML-formatted) string
+          3) Occasionally a single mapping-like object
+        This client emits a text block of the form::
+
+            Test Steps:
+            Action: <...>
+            Expected Result: <...>
+
+            Action: <...>
+            Expected Result: <...>
+
+        The downstream parser handles line-level normalization.
+
+    """
+
+    def __init__(self, server: Optional["calmpy.Server"] = None) -> None:
+        """Initialize the client.
+
+        Args:
+            server: Optional pre-configured ``calmpy.Server``. If omitted,
+                a default instance is created.
+        """
+        self.server: "calmpy.Server | None" = server or calmpy.Server()
+
+    def get_item(self, item_id: int) -> CBItem:
+        """Fetch a Codebeamer item and map it into :class:`CBItem`.
+
+        This reads common metadata (tracker info, parent, priority/status, URL),
+        plus Pre-/Post-Action and Test Steps. Test Steps are normalized into a
+        parser-friendly multi-line string (see class notes).
+
+        Args:
+            item_id: Codebeamer numeric item ID.
+
+        Returns:
+            A normalized :class:`CBItem` container.
+
+        """
+        item = calmpy.Item(server=self.server, item_id=item_id)
+
+        def _get(field_name: str, default: Any = None) -> Any:
+            try:
+                return item[field_name]
+            except Exception as exc:
+                logger.debug("Field %r not accessible on item %d: %s", field_name, item_id, exc)
+                return default
+
+        tracker = getattr(item, "tracker", None)
+        parent = getattr(item, "parent", None)
+
+        pre_action = self._coerce_text(_get("Pre-Action"))
+        post_action = self._coerce_text(_get("Post-Action"))
+
+        # "Test Steps" field naming can vary.
+        test_steps_field = (
+            _get("Test Steps")
+            or _get("TestSteps")
+            or _get("Steps")
+        )
+        test_steps_text = self._format_steps(test_steps_field)
+
+        return CBItem(
+            item_id=item_id,
+            name=getattr(item, "name", f"Item {item_id}"),
+            tracker_name=getattr(tracker, "name", "n/a"),
+            tracker_id=getattr(tracker, "id", -1),
+            parent_name=getattr(parent, "name", None),
+            priority=getattr(item, "priority", None),
+            status=getattr(item, "status", None),
+            url=getattr(item, "url", None),
+            pre_action=pre_action,
+            post_action=post_action,
+            test_steps_text=test_steps_text,
+        )
+
+    @staticmethod
+    def _is_trivial_text(value: str | None) -> bool:
+        """Return True if ``value`` is effectively 'no content'."""
+        if value is None:
+            return True
+        t = str(value).strip().lower()
+        return t in {"", "n/a", "na", "none", "-"}
+
+    @classmethod
+    def _coerce_text(cls, value: Any) -> str | None:
+        """Normalize text-like values to either ``None`` or a stripped string.
+
+        Rules:
+            * ``None``/empty/``N/A``/``-`` ⇒ ``None``.
+            * Otherwise, return a stripped string version.
+        """
+        if value is None:
+            return None
+        s = str(value).strip()
+        return None if cls._is_trivial_text(s) else s
+
+    @staticmethod
+    def _ci_get(mapping: Mapping[str, Any], key: str, default: Any = None) -> Any:
+        """Case-insensitive getter for dict-like objects.
+
+        Useful for "Expected Result" vs "Expected result" variants.
+        """
+        if key in mapping:
+            return mapping[key]
+        key_lower = key.lower()
+        for k, v in mapping.items():
+            if str(k).lower() == key_lower:
+                return v
+        return default
+
+    @classmethod
+    def _format_steps(cls, steps_field: Any) -> str | None:
+        """Format a Codebeamer 'Test Steps' field into a stable text representation.
+
+        Supported inputs:
+            1) ``List[Dict]`` (each with Action/Expected-like keys)
+            2) ``str`` (raw HTML/plain)
+            3) Other (converted to ``str``)
+
+        Returns:
+            A multi-line string beginning with ``"Test Steps:"`` and containing
+            blocks of "Action:" + "Expected Result:" pairs, or ``None`` if empty.
+        """
+        if steps_field is None:
+            return None
+
+        # Case 1: structured list of step dicts
+        if isinstance(steps_field, (list, tuple)) and steps_field and isinstance(steps_field[0], dict):
+            lines: list[str] = ["Test Steps:"]
+            for st in steps_field:
+                action = cls._ci_get(st, "Action", "") or ""
+                action = str(action).strip()
+
+                expected = (
+                    cls._ci_get(st, "Expected Result", None)
+                    or cls._ci_get(st, "Expected result", None)
+                    or cls._ci_get(st, "Expected", None)
+                    or ""
+                )
+                expected = str(expected).strip()
+                if cls._is_trivial_text(expected):
+                    expected = "None"
+
+                # Emit pair (keep label even if empty to be consistent)
+                lines.append(f"Action: {action}" if action else "Action:")
+                lines.append(f"Expected Result: {expected}")
+                lines.append("")  # blank line between steps
+            return "\n".join(lines).rstrip()
+
+        # Case 2: already a string
+        if isinstance(steps_field, str):
+            return steps_field.strip()
+
+        # Case 3: fallback
+        return str(steps_field).strip()

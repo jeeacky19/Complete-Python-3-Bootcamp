@@ -1,0 +1,161 @@
+"""
+Robust CB ID + measurement date extractor for MF4 filenames.
+
+- Keeps existing 7–8 digit ID logic and confidence/tie-break rules.
+- Adds optional date extraction from typical names: "eme_YYYY-MM-DD_..."
+- If date is missing and fallback enabled, uses file mtime.
+- Returns ExtractResult with mf4_date (UTC tz-aware) and date_source ("filename"|"fallback"|None).
+"""
+
+from __future__ import annotations
+
+__all__ = ["extract_from_filename", "IdExtractor"]
+
+import logging
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .results_model import ExtractResult
+
+pythonlogger = logging.getLogger(__name__)
+
+# --- ID patterns (unchanged precedence) -------------------------------------
+
+# 1) PATTERNS (ordered by precedence / confidence)
+#    - P1: any 8+ digits anywhere (highest confidence)
+#    - P2: the RIGHTMOST 7–8 digits before .mf4 (robust fallback)
+_PATTERNS: list[tuple[re.Pattern[str], float, str]] = [
+    # P1: 8+ digits anywhere → 1.00
+    (re.compile(r"(?P<ID>\d{8,})"), 1.00, "P1"),
+    # P2: rightmost 7–8 digits before the .mf4 extension (fallback) → 0.90
+    #     This uses a *single* ID group; it will match even if more tokens follow after that ID.
+    #     Example: "..._8541085_0100hz_v0_n0.mf4"  → captures 8541085
+    (re.compile(r"(?P<ID>\d{7,8})(?=[^.]*\.mf4$)", re.IGNORECASE), 0.90, "P2"),
+]
+
+# Use only file modified time for MF4 date
+DATE_FROM_FILE_MTIME_ONLY = True
+TZ = timezone.utc
+
+
+def _extract_candidates(name: str, min_len: int) -> tuple[list[dict[str, object]], bool]:
+    """Extract all candidate CB item IDs from a filename string.
+
+    Args:
+        name: MF4 filename (basename only, no directory component).
+        min_len: Minimum digit length for a match to be considered.
+
+    Returns:
+        A tuple of ``(candidates, has_8_plus)`` where ``candidates`` is a
+        list of candidate dicts (keys: ``id``, ``confidence``, ``pattern``,
+        ``pos``, ``near_ext``, ``length``) and ``has_8_plus`` indicates
+        whether any 8-or-more digit match was found.
+    """
+    candidates: list[dict[str, object]] = []
+    name_lc = name.lower()
+    ext_pos = name_lc.rfind(".mf4")
+    if ext_pos < 0:
+        ext_pos = len(name_lc)
+
+    has_8_plus = False
+    for rx, conf, tag in _PATTERNS:
+        for m in rx.finditer(name):
+            id_str = m.group("ID")
+            if len(id_str) < min_len:
+                continue
+            if len(id_str) >= 8:
+                has_8_plus = True
+            pos = m.start()
+            near_ext = abs(ext_pos - pos)
+            candidates.append({
+                "id": int(id_str),
+                "confidence": conf,
+                "pattern": tag,
+                "pos": pos,
+                "near_ext": near_ext,
+                "length": len(id_str),
+            })
+    return candidates, has_8_plus
+
+
+def extract_from_filename(name: str, min_len: int = 7) -> ExtractResult | None:
+    """Extract the best CB item ID from a filename string.
+
+    Applies precedence, confidence, length, and rightmost near-extension
+    tie-breakers to select the single best candidate. Does not access the
+    filesystem.
+
+    Args:
+        name: MF4 filename (basename only).
+        min_len: Minimum digit length to consider. Defaults to ``7``.
+
+    Returns:
+        An :class:`~invertest_ai.results_model.ExtractResult` with
+        ``mf4_date`` and ``date_source`` set to ``None``, or ``None`` if
+        no candidate was found.
+    """
+    cands, has_8_plus = _extract_candidates(name, min_len)
+    if not cands:
+        return None
+    if has_8_plus:
+        cands = [c for c in cands if c["length"] >= 8]
+    # Sort: higher confidence, longer length, rightmost near extension
+    cands.sort(key=lambda c: (-c["confidence"], -c["length"], c["near_ext"]))
+    best = cands[0]
+    return ExtractResult(
+        id=best["id"],
+        confidence=best["confidence"],
+        pattern=best["pattern"],
+        source="filename",
+    )
+
+
+class IdExtractor:
+    """Filesystem-aware CB item ID extractor.
+
+    Delegates ID extraction to :func:`extract_from_filename` and enriches
+    the result with an MF4 measurement date derived from the file's
+    modification time.
+    """
+
+    def extract(self, path: Path, min_len: int = 7) -> ExtractResult | None:
+        """Extract CB item ID and measurement date from an MF4 file path.
+
+        Args:
+            path: Absolute or relative path to the MF4 file.
+            min_len: Minimum digit length to consider. Defaults to ``7``.
+
+        Returns:
+            Enriched :class:`~invertest_ai.results_model.ExtractResult` with
+            ``mf4_date`` set to a UTC-aware datetime from the file's mtime,
+            or ``None`` if no ID was found.
+        """
+        base = extract_from_filename(path.name, min_len=min_len)
+        if not base:
+            return None
+
+        mf4_date: datetime | None = None
+        date_source: str | None = None
+
+        if DATE_FROM_FILE_MTIME_ONLY:
+            try:
+                # Interpret Explorer-like "file modified time" as LOCAL time, then store canonical UTC
+                local_dt = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+                mf4_date = local_dt.astimezone(timezone.utc)
+                date_source = "mtime"  # clearer than "fallback" now
+            except Exception as exc:
+                pythonlogger.debug("Could not read mtime for %s: %s", path, exc)
+                mf4_date = None
+                date_source = None
+
+
+        # Return enriched ExtractResult (keep prior fields)
+        return ExtractResult(
+            id=base.id,
+            confidence=base.confidence,
+            pattern=base.pattern,
+            source=base.source,
+            mf4_date=mf4_date,
+            date_source=date_source,
+        )

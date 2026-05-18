@@ -1,0 +1,459 @@
+
+"""Codebeamer test-run fetcher and proximity-based CB status validator."""
+
+from __future__ import annotations
+
+__all__ = ["RunSummary", "CBEvaluationValidator"]
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from calmpy.codebeamer.components import Server  # type: ignore
+from calmpy.exceptions.general import ServerError  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+# --- Configuration -----------------------------------------------------------
+MAP_UNKNOWN_RUN_RESULT_TO_FAIL = True
+TZ = timezone.utc
+TABLE_FIELD_NAME = "IDs von Testruns"  # exact table name if present
+PROXIMITY_DAYS_DEFAULT = 30           # window size for matching runs
+
+# Top-level keys where trackers may store the outcome
+TOP_LEVEL_RESULT_KEYS = (
+    "result", "runResult", "endResult", "reviewResult",
+    "testResult", "executionResult", "status"
+)
+
+# Keys we inspect for finished-at time at top level
+TOP_LEVEL_FINISH_KEYS = (
+    "finishedAt", "closedAt", "finishTime", "endTime", "endedAt", "completionTime",
+)
+
+# Name substrings (case-insensitive) we treat as "this CF holds the result string"
+CF_RESULT_NAME_TOKENS = ("result", "ergebnis", "outcome", "bewertung", "evaluation", "status")
+
+# Name substrings (case-insensitive) we treat as "this CF holds a finish time"
+CF_FINISH_NAME_TOKENS = ("finished", "closed", "beendet", "fertig", "abgeschlossen", "ended", "completion")
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """Normalized summary of a single Codebeamer test run.
+
+    Attributes:
+        run_id: Numeric CB item ID of the test run.
+        finished_at: UTC-aware completion timestamp, or ``None`` if unavailable.
+        result: Normalized result token (``"passed"``, ``"failed"``, ``"blocked"``, or raw).
+        test_run_link: URL to the CB test run item.
+        assignee: Assignee display name, or ``None``.
+    """
+    run_id: int
+    finished_at: datetime | None
+    result: str
+    test_run_link: str
+    assignee: str | None = None
+
+
+def _to_utc(dt_val: Any) -> datetime | None:
+    """Parse a raw CB timestamp value to a UTC-aware datetime.
+
+    Args:
+        dt_val: ISO string, epoch milliseconds (int/float), or ``None``.
+
+    Returns:
+        UTC-aware :class:`datetime`, or ``None`` if parsing fails or input is ``None``.
+    """
+    if dt_val is None:
+        return None
+    try:
+        # epoch milliseconds?
+        if isinstance(dt_val, (int, float)):
+            # Heuristic: treat large numbers as ms
+            sec = dt_val / 1000.0 if dt_val > 10_000_000_000 else float(dt_val)
+            dt = datetime.fromtimestamp(sec, tz=TZ)
+            return dt
+        # ISO string
+        if isinstance(dt_val, str) and dt_val.strip():
+            dt = datetime.fromisoformat(dt_val.strip())
+            dt = dt if dt.tzinfo else dt.replace(tzinfo=TZ)
+            return dt.astimezone(TZ)
+    except Exception:
+        return None
+    return None
+
+
+def _stringify(val: Any) -> str:
+    """Extract a display string from string/dict/list values commonly seen in CB payloads."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, dict):
+        # prefer common keys
+        for k in ("name", "label", "text", "value"):
+            if k in val and val[k]:
+                s = _stringify(val[k])
+                if s:
+                    return s
+        # fallback: any truthy leaf
+        for v in val.values():
+            s = _stringify(v)
+            if s:
+                return s
+        return ""
+    if isinstance(val, list):
+        for item in val:
+            s = _stringify(item)
+            if s:
+                return s
+        return ""
+    return ""
+
+
+def _normalize_result(raw_result: str) -> str:
+    """Normalize a raw CB outcome string to a canonical token.
+
+    Args:
+        raw_result: Raw outcome string from the CB API.
+
+    Returns:
+        One of ``"passed"``, ``"failed"``, ``"blocked"``, or the lowercased
+        input if no synonym matches.
+    """
+    r = (raw_result or "").strip().lower()
+    if not r:
+        return ""
+    # common synonyms → "passed"
+    if r in {"pass", "passed", "ok", "success", "succeeded", "successful"}:
+        return "passed"
+    # common synonyms → "failed"
+    if r in {"fail", "failed", "ko", "error", "unsuccessful"}:
+        return "failed"
+    if "blocked" in r:
+        return "blocked"
+    if "pass" in r:
+        return "passed"
+    if "fail" in r:
+        return "failed"
+    return r
+
+
+class CBEvaluationValidator:
+    """Fetches CB test runs for an item and computes a proximity-based CB status.
+
+    Matching rule:
+        Only runs with ``finished_at`` in ``[mf4_date, mf4_date + proximity_days]``
+        are considered. The run minimizing ``(finished_at - mf4_date)`` is chosen.
+        If none fall inside the window, the result is ``"No Test Run"``.
+        If ``mf4_date`` is ``None``, the result is ``"No MF4 Datum"``.
+    """
+
+    def __init__(self, base_url: str = "https://cb.vwgroup.com",
+                 proximity_days: int = PROXIMITY_DAYS_DEFAULT) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.server = Server(self.base_url)
+        self.proximity_days = int(proximity_days)
+
+    def _mine_test_run_ids_from_parent(self, parent_item_id: int) -> list[int]:
+        """Collect test run IDs linked to a parent CB item via raw REST JSON.
+
+        Tries an exact match on the ``TABLE_FIELD_NAME`` custom field first,
+        then falls back to any custom field whose name contains ``"testrun"``.
+
+        Args:
+            parent_item_id: Numeric CB item ID of the parent test case.
+
+        Returns:
+            Deduplicated list of linked test run IDs in discovery order.
+        """
+        raw = self.server.query.get_item_api(parent_item_id)
+        ids: list[int] = []
+
+        # 1) Exact table name
+        for cf in raw.get("customFields", []):
+            if str(cf.get("name", "")).strip() == TABLE_FIELD_NAME:
+                for row in cf.get("values", []):
+                    if isinstance(row, list):
+                        for col in row:
+                            if isinstance(col, dict) and isinstance(col.get("value"), int):
+                                ids.append(int(col["value"]))
+
+        # 2) Fallback substring if exact table yielded none
+        if not ids:
+            for cf in raw.get("customFields", []):
+                name = str(cf.get("name", "")).lower()
+                if "testrun" in name:
+                    for row in cf.get("values", []):
+                        if isinstance(row, list):
+                            for col in row:
+                                if isinstance(col, dict) and isinstance(col.get("value"), int):
+                                    ids.append(int(col["value"]))
+
+        # de-dup preserve order
+        seen = set()
+        out: list[int] = []
+        for rid in ids:
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
+        return out
+
+    def _extract_finished_at_from_raw(self, raw: dict) -> datetime | None:
+        """Extract UTC-aware finished_at timestamp from raw CB item JSON.
+
+        Tries top-level keys first, then customFields by name tokens, then 'fields'.
+        Accepts ISO strings and epoch ms/sec values in custom field tables.
+
+        Args:
+            raw: Raw CB item API response dict.
+
+        Returns:
+            UTC-aware :class:`datetime`, or ``None`` if not found or parsing fails.
+        """
+        # 1) Top-level keys
+        for key in TOP_LEVEL_FINISH_KEYS:
+            v = raw.get(key)
+            dt = _to_utc(v)
+            if dt:
+                return dt
+
+        # 2) customFields by name tokens
+        for cf in raw.get("customFields", []):
+            name = str(cf.get("name", "")).lower()
+            if any(tok in name for tok in CF_FINISH_NAME_TOKENS):
+                # single value
+                if "value" in cf and cf["value"]:
+                    dt = _to_utc(cf["value"])
+                    if dt:
+                        return dt
+                # matrix
+                for row in cf.get("values", []):
+                    if isinstance(row, list):
+                        for col in row:
+                            dt = _to_utc(col if not isinstance(col, dict) else col.get("value", col))
+                            if dt:
+                                return dt
+
+        # 3) sometimes under 'fields'
+        fields = raw.get("fields", {})
+        if isinstance(fields, dict):
+            for k, v in fields.items():
+                low = str(k).lower()
+                if any(tok in low for tok in CF_FINISH_NAME_TOKENS):
+                    dt = _to_utc(v)
+                    if dt:
+                        return dt
+
+        return None
+
+    def _extract_result_from_raw(self, raw: dict) -> str:
+        """Extract normalized result string from raw CB item JSON.
+
+        Prefers 'Result' from custom fields over top-level status keys.
+        Returns a canonical normalized token or empty string.
+
+        Args:
+            raw: Raw CB item API response dict.
+
+        Returns:
+            Normalized token: ``'passed'``, ``'failed'``, ``'blocked'``, or empty.
+        """
+
+        def normalize_or_empty(v: Any) -> str:
+            s = _stringify(v)
+            return _normalize_result(s)
+
+        # 1) Prefer customFields
+        best_cf_norm = ""
+        for cf in raw.get("customFields", []):
+            name = str(cf.get("name", "")).lower()
+            if any(tok in name for tok in CF_RESULT_NAME_TOKENS):
+                # value
+                if "value" in cf and cf["value"]:
+                    n = normalize_or_empty(cf["value"])
+                    if n in {"passed", "failed", "blocked"}:
+                        return n
+                    if not best_cf_norm:
+                        best_cf_norm = n
+                # values matrix
+                for row in cf.get("values", []):
+                    if isinstance(row, list):
+                        for col in row:
+                            cell = col if not isinstance(col, dict) else col.get("value", col)
+                            n = normalize_or_empty(cell)
+                            if n in {"passed", "failed", "blocked"}:
+                                return n
+                            if not best_cf_norm:
+                                best_cf_norm = n
+
+        # 2) Top-level keys
+        for key in TOP_LEVEL_RESULT_KEYS:
+            if key in raw and raw[key] is not None:
+                n = normalize_or_empty(raw[key])
+                if n in {"passed", "failed", "blocked"}:
+                    return n
+                # else: ignore non-canonical top-level values like "finished"
+
+        # 3) Fallback to non-canonical CF hint or empty
+        return best_cf_norm or ""
+
+    def fetch_runs(self, cb_id: int) -> list[RunSummary]:
+        """Fetch and normalize all test run summaries for a CB item.
+
+        Args:
+            cb_id: Numeric CB item ID that owns the test runs table.
+
+        Returns:
+            List of :class:`RunSummary` objects with UTC timestamps and
+            normalized result tokens. Returns an empty list if the item is
+            not accessible or has no linked runs.
+        """
+        try:
+            run_ids = self._mine_test_run_ids_from_parent(cb_id)
+        except ServerError as ex:
+            # HTTP 400: item not accessible → treat as "No Test Run"
+            logger.warning(
+                "CB item not accessible cb_id=%s → treating as no test runs. %s",
+                cb_id, ex
+            )
+            return []
+
+        if not run_ids:
+            return []
+
+        runs: list[RunSummary] = []
+
+        for rid in run_ids:
+            try:
+                raw = self.server.query.get_item_api(rid)
+            except Exception as exc:
+                logger.debug("Could not fetch run id=%s: %s", rid, exc)
+                continue
+
+            result_raw = self._extract_result_from_raw(raw)
+            finished_dt = self._extract_finished_at_from_raw(raw)
+            norm = _normalize_result(result_raw)
+
+            link = raw.get("url") or f"{self.base_url}/cb/issue/{rid}"
+
+            rs = RunSummary(
+                run_id=rid,
+                finished_at=finished_dt,
+                result=norm,  # store normalized token
+                test_run_link=str(link),
+                assignee=None,  # not used here
+            )
+            runs.append(rs)
+
+        # Diagnostics
+        try:
+            preview = ", ".join(
+                f"{r.run_id}:{r.result or '?'}@{r.finished_at.isoformat() if r.finished_at else 'None'}"
+                for r in runs[:10]
+            )
+            logger.info("CB fetch_runs: cb_id=%s -> %d runs [%s]", cb_id, len(runs), preview)
+        except Exception as exc:
+            logger.debug("Diagnostics logging failed: %s", exc)
+
+        return runs
+
+    def select_closest_run(
+        self,
+        mf4_date: datetime | None,
+        runs: list[RunSummary],
+    ) -> RunSummary | None:
+        """Select the test run closest to ``mf4_date`` within the proximity window.
+
+        Args:
+            mf4_date: UTC-aware measurement date, or ``None``.
+            runs: Candidate :class:`RunSummary` objects.
+
+        Returns:
+            The :class:`RunSummary` with the smallest non-negative
+            ``finished_at - mf4_date`` delta within the window, or ``None``
+            if ``mf4_date`` is ``None`` or no run qualifies.
+        """
+        if mf4_date is None:
+            return None
+
+        ref = mf4_date.astimezone(TZ) if mf4_date.tzinfo else mf4_date.replace(tzinfo=TZ)
+        window = timedelta(days=self.proximity_days)
+
+        inside: list[RunSummary] = []
+        for r in runs:
+            if r.finished_at is None:
+                continue
+            dt = r.finished_at.astimezone(TZ)
+
+            # Only accept runs that finish on/after ref and at most 'window' after ref
+            delta = dt - ref
+            if delta.total_seconds() >= 0 and delta <= window:
+                inside.append(r)
+
+        if not inside:
+            return None
+
+        # Choose the one with the smallest positive delta
+        chosen = min(inside, key=lambda r: (r.finished_at.astimezone(TZ) - ref).total_seconds())
+
+        try:
+            delta_sec = (chosen.finished_at - ref).total_seconds() if chosen.finished_at else None
+            logger.info(
+                "CB closest (>=ref): ref=%s run_id=%s finished_at=%s +delta=%.0fs result=%s",
+                ref, chosen.run_id, chosen.finished_at, (delta_sec or -1), chosen.result
+            )
+        except Exception as exc:
+            logger.debug("Closest-run diagnostics logging failed: %s", exc)
+
+        return chosen
+
+    def map_cb_status(
+        self,
+        mf4_date: datetime | None,
+        runs: list[RunSummary],
+        chosen: RunSummary | None,
+        map_unknown_to_fail: bool = MAP_UNKNOWN_RUN_RESULT_TO_FAIL,
+    ) -> str:
+        """Map the chosen run's result to a CB status string.
+
+        Args:
+            mf4_date: UTC-aware measurement date, or ``None``.
+            runs: All fetched :class:`RunSummary` objects for the item.
+            chosen: Closest matching run, or ``None``.
+            map_unknown_to_fail: If ``True``, unrecognized result tokens map
+                to ``"FAIL"`` rather than ``"PASS"``.
+
+        Returns:
+            One of ``"PASS"``, ``"FAIL"``, ``"No Test Run"``, or ``"No MF4 Datum"``.
+        """
+        if mf4_date is None:
+            return "No MF4 Datum"
+        if not runs:
+            return "No Test Run"
+        if chosen is None:
+            return "No Test Run"
+
+        r = (chosen.result or "").strip().lower()
+        if r == "passed":
+            return "PASS"
+        if r in {"failed", "blocked"}:
+            return "FAIL"
+        return "FAIL" if map_unknown_to_fail else "PASS"
+
+    def close(self) -> None:
+        """Intentionally a no-op.
+
+        calmpy Codebeamer sessions use async resources.
+        Closing them from worker threads or a different event loop
+        causes RuntimeError / 'coroutine was never awaited' warnings.
+
+        For batch execution stability, we keep the session alive
+        for the lifetime of the process and let OS cleanup handle it.
+        """
+        return
+

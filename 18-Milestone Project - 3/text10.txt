@@ -1,0 +1,110 @@
+"""InverTest-AI per-step result aggregator producing PASS / FAIL / No Data verdicts."""
+
+from __future__ import annotations
+
+__all__ = ["InverStatus", "InverSummary", "InverTestValidator"]
+
+import logging
+from dataclasses import dataclass
+from typing import Literal
+
+logger = logging.getLogger(__name__)
+
+
+type InverStatus = Literal["PASS", "FAIL", "No Data"]
+
+
+@dataclass(frozen=True)
+class InverSummary:
+    """Deterministic summary of an InverTest-AI evaluation run.
+
+    Attributes:
+        status: Aggregate verdict — ``"PASS"``, ``"FAIL"``, or ``"No Data"``.
+        overall_pass: ``True`` if all steps passed, ``False`` if any failed,
+            ``None`` if no boolean results were present.
+        passed: Number of steps that evaluated to ``True``.
+        failed: Number of steps that evaluated to ``False``.
+        total_considered: Total number of steps with boolean results.
+    """
+    status: InverStatus
+    overall_pass: bool | None
+    passed: int
+    failed: int
+    total_considered: int
+
+
+class InverTestValidator:
+    """Aggregates per-step boolean results into an overall PASS / FAIL verdict.
+
+    Rules:
+        - Only explicit boolean step results are considered.
+        - ``None`` values (non-evaluating steps) are ignored.
+        - If no boolean results exist, the verdict is ``"No Data"``.
+        - ``"PASS"`` only if all boolean results are ``True``.
+        - ``"FAIL"`` if any boolean result is ``False``.
+    """
+
+    def summarize(
+        self,
+        step_results: list[tuple[int, bool | None]] | None,
+    ) -> InverSummary:
+        """Aggregate step results into an :class:`InverSummary`.
+
+        Args:
+            step_results: List of ``(step_id, result)`` pairs, or ``None``.
+                ``result`` is ``True`` for pass, ``False`` for fail, ``None``
+                for non-evaluating steps.
+
+        Returns:
+            An :class:`InverSummary` with status ``"No Data"`` when
+            ``step_results`` is empty or contains no boolean values.
+        """
+        if not step_results:
+            return InverSummary(
+                status="No Data",
+                overall_pass=None,
+                passed=0,
+                failed=0,
+                total_considered=0,
+            )
+
+        values = [v for _, v in step_results if isinstance(v, bool)]
+
+        if not values:
+            return InverSummary(
+                status="No Data",
+                overall_pass=None,
+                passed=0,
+                failed=0,
+                total_considered=0,
+            )
+
+        passed = sum(1 for v in values if v is True)
+        failed = sum(1 for v in values if v is False)
+        overall_pass = (failed == 0)
+
+        return InverSummary(
+            status="PASS" if overall_pass else "FAIL",
+            overall_pass=overall_pass,
+            passed=passed,
+            failed=failed,
+            total_considered=len(values),
+        )
+
+    def map_inver_status(
+        self,
+        step_results: list[tuple[int, bool | None]] | None,
+    ) -> Literal["PASS", "FAIL"]:
+        """Map step results to a simple ``"PASS"`` or ``"FAIL"`` string.
+
+        Convenience wrapper around :meth:`summarize`. Returns ``"FAIL"`` when
+        ``overall_pass`` is ``None`` (i.e. ``"No Data"`` case).
+
+        Args:
+            step_results: List of ``(step_id, result)`` pairs, or ``None``.
+
+        Returns:
+            ``"PASS"`` if all boolean results are ``True``, ``"FAIL"`` otherwise.
+        """
+        summary = self.summarize(step_results)
+        return "PASS" if summary.overall_pass else "FAIL"

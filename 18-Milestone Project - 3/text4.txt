@@ -1,0 +1,78 @@
+
+"""
+Recursive discovery service for .mf4 files with include/exclude filters.
+
+This module is UI-neutral and safe to call from threads and CLI.
+"""
+from __future__ import annotations
+
+__all__ = ["FileDiscoveryService"]
+
+import fnmatch
+import logging
+from collections.abc import Sequence
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+class FileDiscoveryService:
+    """File system scanner for MF4 measurement files.
+
+    Discovers files recursively under a root directory, applying
+    glob-style include patterns and glob-or-substring exclude rules.
+    """
+
+    def scan(self, root: Path, patterns: Sequence[str], excludes: Sequence[str]) -> list[Path]:
+        """Recursively find files matching include patterns, filtered by exclude rules.
+
+        Each exclude rule is tested as both a glob pattern (against filename and
+        full path) and as a case-insensitive substring. A file is excluded if any
+        rule matches. Results are deduplicated while preserving discovery order.
+
+        Args:
+            root: Root directory to search recursively.
+            patterns: Glob patterns to include (e.g. ``["**/*.mf4"]``).
+                Defaults to ``["**/*.mf4"]`` when empty.
+            excludes: Glob or substring patterns to exclude.
+                Defaults to no exclusions when empty.
+
+        Returns:
+            Deduplicated list of absolute paths to matching files.
+        """
+        root = root.resolve()
+        include_patterns = patterns or ["**/*.mf4"]
+        exclude_rules = excludes or []
+
+        matched: list[Path] = []
+        for inc in include_patterns:
+            # glob only supports ** on Path.glob for recursive patterns
+            for p in root.glob(inc):
+                if not p.is_file():
+                    continue
+                name_lc = p.name.lower()
+                full_lc = str(p).lower()
+
+                skip = False
+                for ex in exclude_rules:
+                    ex_lc = ex.lower()
+                    # support both glob-like and substring exclusion
+                    if fnmatch.fnmatch(name_lc, ex_lc) or fnmatch.fnmatch(full_lc, ex_lc):
+                        skip = True
+                        break
+                    if ex_lc in name_lc or ex_lc in full_lc:
+                        skip = True
+                        break
+
+                if skip:
+                    continue
+                matched.append(p.resolve())
+
+        # Deduplicate while preserving order
+        result: list[Path] = []
+        seen = set()
+        for fp in matched:
+            if fp not in seen:
+                result.append(fp)
+                seen.add(fp)
+        return result

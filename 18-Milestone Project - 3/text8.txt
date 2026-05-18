@@ -1,0 +1,556 @@
+"""
+Single-pass parser for Codebeamer-style step text.
+
+Design:
+- Light normalization (HTML unescape, CR/LF unification, removal of "Action:" and
+  "Expected Result:" labels anywhere). We do NOT aggressively strip comments.
+- One position-agnostic scan finds every "<step_id> <keyword>" anchor ANYWHERE
+  in the text (no line anchoring required).
+- For each anchor, we slice the step "tail" up to the next anchor and parse that
+  tail with a keyword-specific micro-parser. This keeps patterns simple yet robust
+  to inline comments and glued step sequences.
+
+Supported keywords (exactly those in models.Keyword):
+  - Pre Ignition on
+  - Ignition on
+  - Ignition off
+  - Wait <N>ms
+  - Set value <Signal> <rhs>         (rhs: number -> verify-mode; identifier -> capture)
+  - Verify value <Signal> (= token [+/− tol] | !=|<=|>=|<|> token)
+  - Calculate <expr> <outVar>
+  - Compare value <lhs> <op> <rhs>
+  - Get Value <signal> at <timeRef> <outVar>
+  - Get Value <signal> <outVar>      (alias form, no 'at')
+  - Get Time  <signal> <op> <value> [from <startRef>] <outVar>
+"""
+from __future__ import annotations
+
+__all__ = ["parse_cb_steps", "parse_cb_sections"]
+
+import html
+import logging
+import re
+from .models import Step, Keyword
+
+logger = logging.getLogger(__name__)
+
+
+# -----------------------
+# Minimal normalization
+# -----------------------
+def _normalize_for_single_pass(text: str) -> str:
+    """Minimally normalize CB step text for single-pass scanning.
+
+    Performs HTML unescaping, CR/LF normalization, and removal of
+    ``Action:`` / ``Expected Result:`` labels to expose step anchors.
+    Inline comments are intentionally preserved.
+
+    Args:
+        text: Raw CB step text, possibly HTML-encoded.
+
+    Returns:
+        Normalized plain text, or an empty string if input is falsy.
+    """
+    if not text:
+        return ""
+    t = html.unescape(text)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    # Remove labels wherever they appear to expose "NNN <Keyword>" sequences
+    t = re.sub(r"\b(?:Action|Expected\s*Result)\s*:\s*", "", t, flags=re.IGNORECASE | re.MULTILINE)
+    return t
+
+
+# =========================================================
+# Single-pass scanning: find anchors and slice tails
+# =========================================================
+
+# Master detector for any supported keyword anywhere in the text.
+# Captures: (1) step id (1-3 digits), (2) keyword token (canonical text)
+RX_ANY_STEP = re.compile(
+    r"""
+    (?:(?<=^)|(?<=\n)|(?<=\\))  # start-of-text OR newline OR literal backslash
+    \s*                         # optional spaces
+    (\d{1,3})[.)]?\s+           # 1..3 digits; optional trailing dot, then whitespace
+    (
+      Pre\s+Ignition\s+on
+    | Ignition\s+on
+    | Ignition\s+off
+    | Wait\s+until              # must precede bare 'Wait -> in order to capture "Wait until" matches 
+    | Wait(?!\s+until)          # Negative look‑ahead -> "Wait" never matches when followed by “until”
+    | Set\s+Ramp
+    | Set\s+value
+    | Verify\s+value
+    | Calculate
+    | Compare\s+value
+    | Get\s+Value
+    | Get\s+Time
+    | Set\s+Timespan
+    | Verify\s+Raster
+    | Verify\s+variable
+    )
+    \b
+    """,
+    re.IGNORECASE | re.VERBOSE, # IGNORECASE: If raw text is "Get Value", "get value", or mixed case, it will match the same keyword and parse correctly
+)
+
+
+def _collect_anchors(raw: str) -> list[dict[str, object]]:
+    """Scan normalized text and return all step anchor descriptors.
+
+    Each descriptor contains the step ID, keyword text, match bounds,
+    and pre-computed segment bounds (``seg_start``/``seg_end``) that
+    delimit the tail text for that step.
+
+    Args:
+        raw: Normalized step text produced by ``_normalize_for_single_pass``.
+
+    Returns:
+        List of anchor dicts ordered by appearance in ``raw``.
+    """
+    anchors: list[dict[str, object]] = []
+    for m in RX_ANY_STEP.finditer(raw):
+        anchors.append({
+            "sid": int(m.group(1)),
+            "kw": m.group(2),
+            "start": m.start(),
+            "end": m.end(),  # end of "<keyword>" token; tail begins here
+        })
+    # assign segment bounds: [current.end .. next.start) or to EOF
+    for i in range(len(anchors)):
+        anchors[i]["seg_start"] = anchors[i]["end"]
+        anchors[i]["seg_end"] = anchors[i + 1]["start"] if i + 1 < len(anchors) else len(raw)
+    return anchors
+
+def _split_sig(raw: str) -> tuple[str, str]:
+    """
+    Normalize Codebeamer-style signal paths.
+
+    Returns:
+        (raw, leaf) where leaf is the rightmost token after '::'.
+        Safe if '::' is absent (leaf == raw).
+    """
+    raw = (raw or "").strip()
+    leaf = raw.split("::")[-1].strip() if raw else raw
+    return raw, leaf
+
+# =========================================================
+# Keyword-specific tail parsers (anchored at start of tail)
+# =========================================================
+
+# Common token classes:
+_SIG = r"[\w:.\-\\]+"                         # signal path, may include namespace, hyphen, backslash
+_IDENT = r"[A-Za-z_][\w.\-]*"                 # identifier for variables/outVars
+_NUM = r"-?\d+(?:\.\d+)?"                     # int/float (with optional leading -)
+
+def _parse_tail_pre_ignition_on(sid: int, t: str) -> Step:
+    return Step(step_id=sid, keyword=Keyword.PRE_IGNITION_ON)
+
+def _parse_tail_ignition_on(sid: int, t: str) -> Step:
+    return Step(step_id=sid, keyword=Keyword.IGNITION_ON)
+
+def _parse_tail_ignition_off(sid: int, t: str) -> Step:
+    return Step(step_id=sid, keyword=Keyword.IGNITION_OFF)
+
+def _parse_tail_wait(sid: int, t: str) -> Step | None:
+    # Accept "<num>ms" or "<num>s" with flexible whitespace
+    m = re.match(rf"^\s*({_NUM})\s*(ms|s)\b", t, flags=re.IGNORECASE)
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = m.group(2).lower()
+    # normalize to milliseconds for engine consumption
+    ms = int(round(num * (1.0 if unit == "ms" else 1000.0)))
+    return Step(step_id=sid, keyword=Keyword.WAIT, value=ms)
+
+
+def _parse_tail_set_value(sid: int, t: str) -> Step | None:
+    m = re.match(rf"^\s*({_SIG})\s+({_IDENT}|{_NUM})\b", t, flags=re.IGNORECASE)
+    if not m:
+        return None
+    raw, leaf = _split_sig(m.group(1))
+    rhs = m.group(2)
+    try:
+        return Step(step_id=sid, keyword=Keyword.SET_VALUE,
+                    signal_name=leaf, raw_signal=raw, value=float(rhs))
+    except Exception:
+        # capture mode: identifier -> output_var
+        return Step(step_id=sid, keyword=Keyword.SET_VALUE,
+                    signal_name=leaf, raw_signal=raw, value=None, output_var=rhs)
+
+
+
+def _parse_tail_verify_value(sid: int, t: str) -> Step | None:
+    # equality with optional +/- tolerance
+    m = re.match(
+        rf"^\s*({_SIG})\s*=\s*({_IDENT}|\d+(?:\.\d+)?)(?:\s*\+/-\s*(\d+(?:\.\d+)?))?\b",
+        t, flags=re.IGNORECASE,
+    )
+    if m:
+        raw, leaf = _split_sig(m.group(1))
+        rhs_tok = m.group(2)
+        tol = m.group(3)
+        cond = f"= {rhs_tok}" + (f" +/- {tol}" if tol is not None else "")
+        return Step(step_id=sid, keyword=Keyword.VERIFY_VALUE,
+                    signal_name=leaf, raw_signal=raw, value=None, condition=cond)
+
+    # operator form
+    m2 = re.match(
+        rf"^\s*({_SIG})\s*(\!=|\<=|\>=|<|>)\s*({_IDENT}|\d+(?:\.\d+)?)\b",
+        t, flags=re.IGNORECASE,
+    )
+    if m2:
+        raw = m2.group(1)
+        leaf = raw.split("::")[-1]
+        op = m2.group(2)
+        rhs_tok = m2.group(3)
+        cond = f"{op} {rhs_tok}"
+        return Step(step_id=sid, keyword=Keyword.VERIFY_VALUE,
+                    signal_name=leaf, raw_signal=raw, value=None, condition=cond)
+    return None
+
+
+def _parse_tail_calculate(sid: int, t: str) -> Step | None:
+    m = re.match(rf"^\s*(.+?)\s+({_IDENT})\b", t, flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    expr_raw = m.group(1).strip()
+
+    # If expression starts with "abs " (prefix form), rewrite to abs(<expr>)
+    # Example: "abs T2-T1" -> "abs(T2-T1)"
+    if re.match(r"^abs\s+", expr_raw, flags=re.IGNORECASE):
+        expr_raw = "abs(" + re.sub(r"^abs\s+", "", expr_raw, flags=re.IGNORECASE).strip() + ")"
+
+    expr_norm = re.sub(r"\s+", "", expr_raw)
+    outvar = m.group(2)
+
+    return Step(step_id=sid, keyword=Keyword.CALCULATE, expr=expr_norm, output_var=outvar)
+
+
+def _parse_tail_compare_value(sid: int, t: str) -> Step | None:
+    m = re.match(
+        rf"^\s*({_SIG})\s*(=|!=|<=|>=|<|>)\s*({_NUM}|{_IDENT})"
+        rf"(?:\s+({_IDENT}))?"       # ← NEW: optional time_ref (Span1, T2, ...)
+        rf"\b",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    raw_lhs, lhs_leaf = _split_sig(m.group(1))
+    op = m.group(2)
+    rhs = m.group(3)
+    time_ref = m.group(4)           # ← NEW: None if not present
+    return Step(
+        step_id=sid,
+        keyword=Keyword.COMPARE_VALUE,
+        lhs=lhs_leaf,
+        lhs_raw=raw_lhs,
+        op=op,
+        rhs=rhs,
+        time_ref=time_ref,          # ← NEW
+    )
+
+
+def _parse_tail_get_time(sid: int, t: str) -> Step | None:
+    # Supports:
+    #   Get Time <sig> <op> <thr> [+/- <tol>] [from <startRef>] <outVar>
+    #   Get Time <sig> <op> <thr> [+/- <tol>] <startRef> <outVar>   (implicit "from")
+    #   Get Time <sig> <op> <thr> [+/- <tol>] <outVar>
+
+    m = re.match(
+        rf"^\s*({_SIG})\s*(\!=|<=|>=|<|>|=)\s*({_NUM})"
+        rf"(?:\s*\+/-\s*({_NUM}))?\s*"
+        rf"(?:from\s+({_IDENT}|{_NUM}))?\s+({_IDENT})\b",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+
+    raw, leaf = _split_sig(m.group(1))
+    op = m.group(2)
+    thr = float(m.group(3))
+    tol = float(m.group(4)) if m.group(4) is not None else None
+    start_ref = m.group(5)
+    outvar = m.group(6)
+
+    # Variant B: implicit startRef without "from"
+    # If there is no "from", we may still have TWO trailing identifiers:
+    #   "<thr> [+/- <tol>] <startRef> <outVar>"
+    if start_ref is None:
+        rest = t[m.end():].strip()
+        m2 = re.match(rf"^({_IDENT}|{_NUM})\b", rest, flags=re.IGNORECASE)
+        if m2:
+            start_ref = outvar
+            outvar = m2.group(1)
+
+    return Step(
+        step_id=sid,
+        keyword=Keyword.GET_TIME,
+        signal_name=leaf,
+        raw_signal=raw,
+        op=op,
+        value=thr,
+        tolerance=tol,           # ✅ NEW: store "+/- tol" here
+        start_ref=start_ref,
+        output_var=outvar,
+    )
+
+
+def _parse_tail_get_value(sid: int, t: str) -> Step | None:
+    # "at" form
+    m = re.match(rf"^\s*({_SIG})\s+at\s+({_IDENT}|\d+(?:\.\d+))\s+({_IDENT})\b", t, flags=re.IGNORECASE)
+    if m:
+        # raw = m.group(1); leaf = raw.split("::")[-1]
+        raw, leaf = _split_sig(m.group(1))
+        tref = m.group(2)
+        outv = m.group(3)
+        return Step(step_id=sid, keyword=Keyword.GET_VALUE,
+                    signal_name=leaf, raw_signal=raw, time_ref=tref, output_var=outv)
+
+    # alias form (no 'at')
+    m2 = re.match(rf"^\s*({_SIG})\s+({_IDENT})\b", t, flags=re.IGNORECASE)
+    if m2:
+        raw = m2.group(1)
+        leaf = raw.split("::")[-1]
+        outv = m2.group(2)
+        return Step(step_id=sid, keyword=Keyword.GET_VALUE,
+                    signal_name=leaf, raw_signal=raw, time_ref=None, output_var=outv)
+    return None
+
+
+def _parse_tail_set_timespan(sid: int, t: str) -> Step | None:
+    """
+    Grammar:
+        Set Timespan <T1> <T2> in <OutVar>
+    where <T1>, <T2> are identifiers (derived timestamps) or numeric literals.
+    """
+    m = re.match(
+        rf"^\s*({_IDENT}|{_NUM})\s+({_IDENT}|{_NUM})\s+in\s+({_IDENT})\b",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    t1_ref = m.group(1)
+    t2_ref = m.group(2)
+    outvar = m.group(3)
+    return Step(step_id=sid, keyword=Keyword.SET_TIMESPAN, start_ref=t1_ref, end_ref=t2_ref, output_var=outvar)
+
+
+def _parse_tail_verify_raster(sid: int, t: str) -> Step | None:
+    """
+    Verify Raster <SignalPath> in <target> [+/- <tol>] [ms|s|Hz]
+    Unit is IGNORED; engine always interprets values in milliseconds.
+    """
+    # Accept optional unit, but don't capture it into the Step.
+    m = re.match(
+        rf"^\s*({_SIG})\s+in\s+({_NUM})(?:\s*\+/-\s*({_NUM}))?(?:\s*(?:ms|s|Hz))?\b",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    # raw_path = m.group(1)					# full path (e.g., "CAN-Monitoring::EM1_IstSpannung")
+    # last_token = raw_path.split("::")[-1]	# engine resolves via alias/name
+    raw_path, last_token = _split_sig(m.group(1))
+    target = float(m.group(2))
+    tol = float(m.group(3)) if m.group(3) is not None else 0.0
+    return Step(
+        step_id=sid,
+        keyword=Keyword.VERIFY_RASTER,
+        signal_name=last_token,
+        value=target,           # interpreted as milliseconds
+        tolerance=tol,          # interpreted as milliseconds
+        raw_signal=raw_path,	# for CAN/ETK inference
+    )
+
+
+def _parse_tail_verify_variable(sid: int, t: str) -> Step | None:
+    m = re.match(
+        rf"^\s*({_IDENT})\s*(=|!=|<=|>=|<|>)\s*({_IDENT}|{_NUM})\b",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return Step(
+        step_id=sid,
+        keyword=Keyword.VERIFY_VARIABLE,
+        lhs=m.group(1),   # variable name (string key in engine.vars)
+        op=m.group(2),    # operator
+        rhs=m.group(3),   # number OR another variable name
+    )
+
+
+def _parse_tail_wait_until(sid: int, t: str) -> Step | None:
+    # '=' with optional tolerance
+    m = re.match(
+        rf"^\s*({_SIG})\s*=\s*({_IDENT}|{_NUM})(?:\s*\+/-\s*({_NUM}))?\b",
+        t, flags=re.IGNORECASE
+    )
+    if m:
+        raw, leaf = _split_sig(m.group(1))
+        rhs_tok = m.group(2)
+        tol = m.group(3)
+        return Step(step_id=sid, keyword=Keyword.WAIT_UNTIL,
+                    signal_name=leaf, raw_signal=raw, op="=", rhs=rhs_tok,
+                    tolerance=float(tol) if tol is not None else 0.0)
+
+    # relational ops
+    m2 = re.match(
+        rf"^\s*({_SIG})\s*(\!=|\<=|\>=|<|>)\s*({_IDENT}|{_NUM})\b",
+        t, flags=re.IGNORECASE
+    )
+    if m2:
+        raw = m2.group(1)
+        leaf = raw.split("::")[-1]
+        op = m2.group(2)
+        rhs_tok = m2.group(3)
+        return Step(step_id=sid, keyword=Keyword.WAIT_UNTIL,
+                    signal_name=leaf, raw_signal=raw, op=op, rhs=rhs_tok,
+                    tolerance=None)
+    return None
+
+
+def _parse_tail_set_ramp(sid: int, t: str) -> Step | None:
+
+    # 1) Control signal + from/to range (must be present)
+    m_head = re.search(
+        rf"\s*({_SIG})\s+from\s+({_IDENT}|{_NUM})\s+to\s+({_IDENT}|{_NUM})",
+        t, flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not m_head:
+        return None
+    
+    
+    # ✅ Normalize control signal using shared helper
+    ctrl_raw, ctrl_leaf = _split_sig(m_head.group(1))
+    start_tok, end_tok = m_head.group(2), m_head.group(3)
+
+    # Slice the remainder after the head to search for 'with' and 'wait' anywhere
+    rest = t[m_head.end():]
+
+    # 2) Step size: look for "with <num>" anywhere in 'rest'
+    m_step = re.search(rf"\bwith\s+({_NUM})\b", rest, flags=re.IGNORECASE | re.DOTALL)
+    if not m_step:
+        return None
+    step_str = m_step.group(1)
+
+    # 3) Wait ms: look for "wait <num>" anywhere in 'rest'
+    m_wait = re.search(rf"\bwait\s+({_NUM})\b", rest, flags=re.IGNORECASE | re.DOTALL)
+    if not m_wait:
+        return None
+    wait_str = m_wait.group(1)
+
+    # 4) Optional check: "check <SIG> +/- <NUM>"
+    m_chk = re.search(
+        rf"\bcheck\s+({_SIG})\s*\+/-\s*({_NUM})\b",
+        rest, flags=re.IGNORECASE | re.DOTALL,
+    )
+    chk_raw = m_chk.group(1) if m_chk else None
+    chk_leaf = chk_raw.split("::")[-1] if m_chk else None
+    tol_str = m_chk.group(2) if m_chk else None
+
+    return Step(
+        step_id=sid,
+        keyword=Keyword.SET_RAMP,
+        signal_name=ctrl_leaf,          # control signal (leaf)
+        raw_signal=ctrl_raw,            # control raw signal (leaf)
+        start_ref=start_tok,            # number or var (resolved in engine)
+        end_ref=end_tok,                # number or var (resolved in engine)
+        value=float(step_str),          # step size
+        time_ref=wait_str,              # wait_ms (string; engine parses to int)
+        lhs=chk_leaf,                   # optional check signal (leaf)
+        lhs_raw=chk_raw,                # optional check raw signal (leaf)
+        tolerance=float(tol_str) if tol_str is not None else None,
+    )
+
+
+# Map normalized keyword to a tail parser
+_DISPATCH = [
+    (re.compile(r"^Pre\s+Ignition\s+on$",   re.IGNORECASE), _parse_tail_pre_ignition_on),
+    (re.compile(r"^Ignition\s+on$",         re.IGNORECASE), _parse_tail_ignition_on),
+    (re.compile(r"^Ignition\s+off$",        re.IGNORECASE), _parse_tail_ignition_off),
+    (re.compile(r"^Wait$",                  re.IGNORECASE), _parse_tail_wait),
+    (re.compile(r"^Set\s+value$",           re.IGNORECASE), _parse_tail_set_value),
+    (re.compile(r"^Verify\s+value$",        re.IGNORECASE), _parse_tail_verify_value),
+    (re.compile(r"^Calculate$",             re.IGNORECASE), _parse_tail_calculate),
+    (re.compile(r"^Compare\s+value$",       re.IGNORECASE), _parse_tail_compare_value),
+    (re.compile(r"^Get\s+Time$",            re.IGNORECASE), _parse_tail_get_time),
+    (re.compile(r"^Get\s+Value$",           re.IGNORECASE), _parse_tail_get_value),
+    (re.compile(r"^Set\s+Timespan$",        re.IGNORECASE), _parse_tail_set_timespan),
+    (re.compile(r"^Verify\s+Raster$",       re.IGNORECASE), _parse_tail_verify_raster),
+    (re.compile(r"^Verify\s+variable$",     re.IGNORECASE), _parse_tail_verify_variable),
+    (re.compile(r"^Wait\s+until$",          re.IGNORECASE), _parse_tail_wait_until),
+    (re.compile(r"^Set\s+Ramp$",            re.IGNORECASE), _parse_tail_set_ramp),
+]
+
+
+# =========================================================
+# Public API
+# =========================================================
+def parse_cb_steps(text: str) -> list[Step]:
+    """Parse a flat CB step text block into a sorted list of Steps.
+
+    Runs a single-pass scan to find all ``<step_id> <keyword>`` anchors,
+    slices each tail, dispatches to the appropriate keyword micro-parser,
+    and returns results sorted by ``step_id``. Steps whose tails do not
+    match the expected pattern are silently skipped and logged at DEBUG.
+
+    Args:
+        text: Raw or HTML-encoded CB step text.
+
+    Returns:
+        Steps sorted ascending by ``step_id``.
+    """
+    raw = _normalize_for_single_pass(text)
+    if not raw:
+        return []
+
+    anchors = _collect_anchors(raw)
+
+    steps: list[Step] = []
+
+    for a in anchors:
+        sid = int(a["sid"])
+        kw = str(a["kw"])
+        tail = raw[int(a["seg_start"]): int(a["seg_end"])]
+
+        # dispatch by keyword
+        st: Step | None = None
+        for rx, fn in _DISPATCH:
+            if rx.match(kw):
+                st = fn(sid, tail)
+                break
+        if st is not None:
+            steps.append(st)
+        else:
+            logger.debug("Step %d (%r): tail did not match any pattern, skipping", sid, kw)
+
+    steps.sort(key=lambda s: s.step_id)
+    return steps
+
+
+def parse_cb_sections(
+    pre_action_text: str | None,
+    test_steps_text: str | None,
+    post_action_text: str | None,
+) -> dict[str, list[Step]]:
+    """Parse the three standard CB text sections into separate Step lists.
+
+    Args:
+        pre_action_text: Raw Pre-Action field text, or ``None``.
+        test_steps_text: Raw Test Steps field text, or ``None``.
+        post_action_text: Raw Post-Action field text, or ``None``.
+
+    Returns:
+        Dict with keys ``"pre"``, ``"steps"``, ``"post"``, each mapping
+        to a list of parsed ``Step`` objects.
+    """
+    return {
+        "pre": parse_cb_steps(pre_action_text or ""),
+        "steps": parse_cb_steps(test_steps_text or ""),
+        "post": parse_cb_steps(post_action_text or ""),
+    }

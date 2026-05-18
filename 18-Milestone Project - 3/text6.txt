@@ -1,0 +1,98 @@
+"""
+ASAM MDF convenience service.
+
+A very small façade over :mod:`asammdf` that exposes:
+    * ``channels()`` – discover channel names (best-effort across versions)
+    * ``has(name)`` – membership test
+    * ``get(name)`` – retrieve a Signal object (timestamps/samples)
+
+The wrapper exists to:
+    * keep the rest of the app independent from specific asammdf versions,
+    * provide a single place to evolve discovery behavior if the upstream API shifts.
+"""
+from __future__ import annotations
+
+__all__ = ["MeasurementServiceProtocol", "MDFService"]
+
+import logging
+from typing import Protocol
+
+from asammdf import MDF  # type: ignore
+from asammdf import Signal
+
+logger = logging.getLogger(__name__)
+
+
+class MeasurementServiceProtocol(Protocol):
+    """Structural interface for MDF measurement file access.
+
+    Any object implementing these four methods is a valid measurement
+    service and can be injected wherever ``MDFService`` is currently used.
+    This enables unit testing without real MF4 files.
+    """
+
+    def channels(self) -> list[str]:
+        """Return all channel names present in the measurement file."""
+        ...
+
+    def has(self, channel: str) -> bool:
+        """Return ``True`` if ``channel`` exists in the measurement file."""
+        ...
+
+    def get(self, channel: str) -> Signal:
+        """Return the Signal object for ``channel``."""
+        ...
+
+    def close(self) -> None:
+        """Release the underlying file handle."""
+        ...
+
+
+class MDFService:
+    """Façade over :mod:`asammdf` for MDF measurement file access.
+
+    Implements :class:`MeasurementServiceProtocol`. Keeps the rest of the
+    application independent from specific ``asammdf`` version details.
+
+    Attributes:
+        path: Absolute path to the opened MDF file.
+        mdf: Underlying :class:`asammdf.MDF` instance.
+    """
+
+    def __init__(self, path: str) -> None:
+        """Load the MDF file at ``path``."""
+        self.path = path
+        self.mdf = MDF(path)
+
+    def channels(self) -> list[str]:
+        """Return a list of channel names.
+
+        Tries the common ``channels_db`` attribute first; falls back to iterating
+        channels if needed (for older versions).
+        """
+        try:
+            # asammdf ≥ 7: channels_db is commonly used in user code
+            return list(self.mdf.channels_db.keys())
+        except Exception as exc:
+            # Fallback for versions with different API
+            logger.debug("channels_db unavailable, falling back to iteration: %s", exc)
+            return [c.name for c in self.mdf.channels()]
+
+    def has(self, channel: str) -> bool:
+        """Return True if the MDF file contains ``channel``."""
+        try:
+            return channel in self.mdf
+        except Exception as exc:
+            logger.debug("'in' operator failed for channel %r, falling back to list: %s", channel, exc)
+            return channel in self.channels()
+
+    def get(self, channel: str) -> Signal:
+        """Return the Signal (with ``timestamps`` and ``samples``) for ``channel``."""
+        return self.mdf.get(channel)  # asammdf Signal
+
+    def close(self) -> None:
+        """Close the underlying MDF handle."""
+        close = getattr(self.mdf, "close", None)
+        if callable(close):
+            close()
+

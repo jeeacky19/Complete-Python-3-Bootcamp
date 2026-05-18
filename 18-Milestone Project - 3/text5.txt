@@ -1,0 +1,133 @@
+"""Signal name alias registry for the InverTest-AI evaluation engine.
+
+Provides a merged alias dictionary built from hardcoded defaults and an
+optional ``aliases.json`` override file located next to this module.
+"""
+from __future__ import annotations
+
+__all__ = ["build_alias_dict"]
+
+import json
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_ALIASES = {
+    # --- Original DEFAULT_ALIASES ---
+    # "MDL_mOut_SwitchHVDC_None": "PST_Status_DTS_Trennen_AKT",   # old
+    "MDL_mOut_SwitchHVDC_None": "PST_SO_DC_Schuetze_trennen",   # new from 2026 jan
+    # "MDL_mIn_SwitchHVDC_None": "Flag_DC_Schuetze.AKT",          # old
+    "MDL_mIn_SwitchHVDC_None": "PST_STS_DC_Schuetze_offen",     # new from 2026 jan
+    "mIn_uDCLink_V": "PST_SollSpannung_DC",
+    "Pre_Ignition": "U_KL15",
+    "HVK_AktiveEntladung_Anf": "PST_TRIM_CRC_HVK_01",
+    "EM1_IstSpannung": "PST_SollSpannung_DC",
+    "fac_nElm": "PECApp_fac_nElm_C_VW",
+    "mIn_EM1_DesSpeed_rpm": "PST_SollDrehzahl_HM",
+
+    # --- Additions (deduped keys; kept original values where keys collide) ---
+    "MDL_mOut_AmbientTemp_degC": "PST_Temp_KK_CAN", # Old Alias: T_LUFT
+    "MDL_mIn_AmbientTemp_degC": "PST_Temp_KK_Soll_CAN",
+    "mOut_Coolant_Inlet_Temperature_DegC": "T_WASSER_1",
+
+    # Split from concatenated line:
+    "MDL_mOut_FlowRateInlet_Inverter_L_m": "PST_LE_KuehlDurchfluss_CAN",
+    "MDL_mIn_FlowRateInlet_Inverter_L_m": "PST_LE_KuehlDurchfluss_CAN",
+    "mIn_BusOff_None": "PST_CAN_SLEEP",
+
+    # The following two keys appear twice intentionally: the second entry
+    # (2026 jan value) silently overwrites the first. Last value wins in a
+    # Python dict literal — this is the desired precedence behaviour.
+
+    "TCG_Model_Vehicle__Clamp30__Current": "PST_LE_I_KL30_CAN",
+    "TCG_Model_Vehicle__Clamp30_Current": "PST_LE_I_KL30_CAN",
+    "TCG_Model_Vehicle__Clamp30_VoltageRead": "PST_LE_U_KL30_CAN",
+    "TCG_Model_Vehicle__Clamp30_VoltageSupplyControl": "U_KL30",
+    "MDL_mOut_HVDC": "PST_LE_U_Batterie_CAN",
+
+    # The Airbag line looked concatenated; split into two clear pairs:
+    "Airbag_01_BZ": "PST_TRIM_CRC_Airbag01",
+    "Clamp30": "U_KL30",
+
+    "MDL_mOut_iHV_Strom_A": "current_EME",
+    "EM1_Strom_HV": "current_PWR",
+
+    "MDL_mOut_IstMomentModell_Nm": "M_HM",
+    "mIn_Rotorsensor_sin_norm_setscaling": "DRS_SincosAmpB.AV",
+
+    "HVK_01_CRC": "PST_TRIM_CRC_HVK_01",
+    "mIn_Coolant_Inlet_Temperature_DegC": "PST_LE_Vorl_Temp_Soll_CAN",
+    "mIn_HVK_01_BZ_Switch_None": "PST_TRIM_BZ_HVK_01",
+    "Zusatzkapazitat": "PST_Status_Relais_04",
+    "mOut_iDCLink_A": "I_DC",
+    "mOut_uDCLink_V": "PST_LE_U_Batterie_CAN",
+    "mIn_Airbag_01_BZ_Switch_None": "PST_TRIM_BZ_Airbag_01",
+    "mOut_Airbag_01_BZ_Switch_None": "PST_TRIM_BZ_Airbag_01",
+    "mOut_HVK_01_BZ_Switch_None": "PST_TRIM_BZ_HVK_01",
+}
+
+
+def build_alias_dict() -> dict[str, str]:
+    """Build and return the merged signal alias dictionary.
+
+    Merges ``DEFAULT_ALIASES`` with entries from ``aliases.json`` if the file
+    exists and is valid. Entries in ``aliases.json`` overwrite defaults.
+
+    Returns:
+        Mapping of model signal names to their measurement signal equivalents.
+
+    Note:
+        If ``aliases.json`` is missing, malformed, or unreadable, the function
+        logs the issue and returns the default aliases unchanged.
+    """
+    alias: dict[str, str] = dict(DEFAULT_ALIASES)
+
+    app_dir = Path(__file__).resolve().parent
+    aliases_json = app_dir / "aliases.json"
+
+    if not aliases_json.exists():
+        logger.debug("No aliases.json found at %s – using DEFAULT_ALIASES only", aliases_json)
+        return alias
+
+    try:
+        text = aliases_json.read_text(encoding="utf-8")
+        data = json.loads(text)
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "aliases.json ignored: expected JSON object (dict), got %s",
+                type(data).__name__,
+            )
+            return alias
+
+        normalized = {str(k): str(v) for k, v in data.items()}
+        alias.update(normalized)
+
+        logger.info(
+            "Loaded %d external aliases from %s",
+            len(normalized),
+            aliases_json,
+        )
+
+    except json.JSONDecodeError as ex:
+        logger.error(
+            "Failed to parse aliases.json (%s): %s",
+            aliases_json,
+            ex,
+        )
+
+    except OSError as ex:
+        logger.error(
+            "Failed to read aliases.json (%s): %s",
+            aliases_json,
+            ex,
+        )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error while loading aliases.json (%s)",
+            aliases_json,
+        )
+
+    return alias
