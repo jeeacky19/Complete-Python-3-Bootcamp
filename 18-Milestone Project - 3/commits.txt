@@ -1,0 +1,45 @@
+Commit stratégia javaslat
+A legegyszerűbb megközelítés: egy commit modulonként, logikai tier-sorrendben. Ez azt jelenti, hogy a git history olvasható marad, és ha bármikor vissza kell térni egy modulhoz, pontosan megtalálod.
+
+Commit üzenetek
+Másold be ezeket sorrendben a terminálba:
+powershellgit add src/invertest_ai/models.py
+git commit -m "refactor(models): modernize types, freeze dataclasses, add __all__"
+
+git add src/invertest_ai/logging_utils.py
+git commit -m "refactor(logging_utils): add __all__, modernize types, fix bare excepts"
+
+git add src/invertest_ai/results_model.py
+git commit -m "refactor(results_model): modernize types, PEP 695 BatchStatus, add __all__"
+
+git add src/invertest_ai/discovery.py
+git commit -m "refactor(discovery): add __all__, Sequence params, Google-style docs"
+
+git add src/invertest_ai/aliases.py
+git commit -m "refactor(aliases): add __all__, remove dead code, rename log -> logger"
+
+git add src/invertest_ai/mdf_service.py
+git commit -m "refactor(mdf_service): introduce MeasurementServiceProtocol, add __all__"
+
+git add src/invertest_ai/cb_client.py
+git commit -m "refactor(cb_client): introduce CodebeamerClientProtocol, add __all__"
+
+git add src/invertest_ai/parser.py
+git commit -m "refactor(parser): remove debug hook, modernize types, fix bare excepts"
+
+git add src/invertest_ai/id_extractor.py
+git commit -m "refactor(id_extractor): modernize types, add logger, Google-style docs"
+
+git add src/invertest_ai/validation_inver.py
+git commit -m "refactor(validation_inver): PEP 695 InverStatus, add __all__, docs"
+
+git add src/invertest_ai/validation_cb.py
+git commit -m "refactor(validation_cb): freeze RunSummary, remove dead code, fix excepts"
+
+
+A pyproject.toml változás külön commit legyen, mert az nem modulrefaktor:
+powershellgit add pyproject.toml
+git commit -m "chore(pyproject): bump requires-python to 3.12, drop typing-extensions dep"
+
+Amit holnap folytatunk
+A soron következő modul: #12 — engine.py (3 732 sor). Ez a legtöbb tervezést igénylő lépés — az analyse lépés itt nem egy prompt, hanem egy részletes almodulonkénti bo
